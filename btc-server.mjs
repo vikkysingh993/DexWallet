@@ -1,11 +1,11 @@
-import express from 'express';
-import bodyParser from 'body-parser';
-import dotenv from 'dotenv';
-import axios from 'axios';
-import * as bitcoin from 'bitcoinjs-lib';
-import bip39 from 'bip39';
-import * as ecc from 'tiny-secp256k1';
-import { BIP32Factory } from 'bip32';
+import express from "express";
+import dotenv from "dotenv";
+import axios from "axios";
+import * as bitcoin from "bitcoinjs-lib";
+import bip39 from "bip39";
+import * as ecc from "tiny-secp256k1";
+import { BIP32Factory } from "bip32";
+import { ECPairFactory } from "ecpair";
 
 dotenv.config();
 
@@ -14,18 +14,24 @@ dotenv.config();
 ================================ */
 
 bitcoin.initEccLib(ecc);
+
 const bip32 = BIP32Factory(ecc);
+const ECPair = ECPairFactory(ecc);
 
 const router = express.Router();
-router.use(bodyParser.json());
 
 /* ===============================
-   BTC MAINNET CONFIG (FIXED)
+   TATUM CONFIG (BTC MAINNET)
 ================================ */
 
-const NETWORK_NAME = 'mainnet';
+const NETWORK_NAME = "mainnet";
 const NETWORK = bitcoin.networks.bitcoin;
-const BLOCKSTREAM_API = 'https://blockstream.info/api';
+
+const TATUM_API = "https://api.tatum.io/v3";
+const TATUM_HEADERS = {
+  "x-api-key": process.env.TATUM_API_KEY,
+  "Content-Type": "application/json"
+};
 
 // BIP84 Native SegWit
 const DEFAULT_PURPOSE = 84;
@@ -55,7 +61,7 @@ function buildAddressFromNode(node) {
 
 function deriveFromMnemonic(mnemonic, account = 0, addressIndex = 0) {
   if (!bip39.validateMnemonic(mnemonic)) {
-    throw new Error('Invalid mnemonic');
+    throw new Error("Invalid mnemonic");
   }
 
   const seed = bip39.mnemonicToSeedSync(mnemonic);
@@ -67,39 +73,44 @@ function deriveFromMnemonic(mnemonic, account = 0, addressIndex = 0) {
   return { child, path };
 }
 
+/* ===============================
+   TATUM API HELPERS
+================================ */
+
+// Fetch UTXOs
 async function fetchUtxos(address) {
-  const r = await axios.get(`${BLOCKSTREAM_API}/address/${address}/utxo`);
-  return r.data;
+  const r = await axios.get(
+    `${TATUM_API}/bitcoin/utxo/${address}`,
+    { headers: TATUM_HEADERS }
+  );
+
+  // Convert to bitcoinjs format
+  return r.data.map(u => ({
+    txid: u.hash,
+    vout: u.index,
+    value: Number(u.value)
+  }));
 }
 
-async function fetchBalance(address) {
-  const r = await axios.get(`${BLOCKSTREAM_API}/address/${address}`);
-  const { chain_stats, mempool_stats } = r.data;
-
-  const confirmed =
-    (chain_stats.funded_txo_sum || 0) -
-    (chain_stats.spent_txo_sum || 0);
-
-  const mempool =
-    (mempool_stats.funded_txo_sum || 0) -
-    (mempool_stats.spent_txo_sum || 0);
-
-  const total = confirmed + mempool;
-
-  return {
-    sats: total,
-    btc: satsToBtc(total),
-    confirmed_sats: confirmed
-  };
-}
-
+// Fetch fee rate (sat/vB)
 async function fetchFeeRate() {
-  try {
-    const r = await axios.get(`${BLOCKSTREAM_API}/fee-estimates`);
-    return Math.max(Math.round(r.data['1'] || 10), 1);
-  } catch {
-    return 10;
-  }
+  const r = await axios.get(
+    `${TATUM_API}/bitcoin/fees`,
+    { headers: TATUM_HEADERS }
+  );
+
+  return Math.max(Number(r.data.fast), 1);
+}
+
+// Broadcast transaction
+async function broadcastTx(hex) {
+  const r = await axios.post(
+    `${TATUM_API}/bitcoin/broadcast`,
+    { txData: hex },
+    { headers: TATUM_HEADERS }
+  );
+
+  return r.data.txId;
 }
 
 function estimateTxVsize(inputs, outputs) {
@@ -124,45 +135,32 @@ function selectUtxosGreedy(utxos, target) {
   return { chosen, sum };
 }
 
-async function broadcastTx(hex) {
-  const r = await axios.post(
-    `${BLOCKSTREAM_API}/tx`,
-    hex,
-    { headers: { 'Content-Type': 'text/plain' } }
-  );
-  return r.data;
-}
-
 /* ===============================
    ROUTES
 ================================ */
 
 // Health
-router.get('/health', (req, res) => {
+router.get("/health", (req, res) => {
   res.json({
     ok: true,
     network: NETWORK_NAME,
-    explorer: BLOCKSTREAM_API
+    provider: "tatum"
   });
 });
 
 // Create wallet
-router.post('/wallet/create', (req, res) => {
+router.post("/wallet/create", (req, res) => {
   try {
-    const { words = 12, accountIndex = 0, addressIndex = 0 } = req.body;
+    const { words = 12 } = req.body;
 
     if (![12, 24].includes(words)) {
-      return res.status(400).json({ error: 'words must be 12 or 24' });
+      return res.status(400).json({ error: "words must be 12 or 24" });
     }
 
     const strength = words === 24 ? 256 : 128;
     const mnemonic = bip39.generateMnemonic(strength);
 
-    const { child, path } = deriveFromMnemonic(
-      mnemonic,
-      accountIndex,
-      addressIndex
-    );
+    const { child, path } = deriveFromMnemonic(mnemonic);
 
     res.json({
       network: NETWORK_NAME,
@@ -176,154 +174,97 @@ router.post('/wallet/create', (req, res) => {
   }
 });
 
-// Import wallet (WIF)
-router.post('/wallet/import', (req, res) => {
-  try {
-    const { privateKeyWIF } = req.body;
-    if (!privateKeyWIF) {
-      return res.status(400).json({ error: 'privateKeyWIF required' });
-    }
 
-    const keyPair = bitcoin.ECPair.fromWIF(privateKeyWIF, NETWORK);
-    const address = bitcoin.payments.p2wpkh({
-      pubkey: keyPair.publicKey,
-      network: NETWORK
-    }).address;
+
+
+/* ===============================
+   GET BTC BALANCE (TATUM)
+================================ */
+router.get("/:address/balance", async (req, res) => {
+  try {
+    const { address } = req.params;
+
+    const r = await axios.get(
+      `${TATUM_API}/bitcoin/address/balance/${address}`,
+      { headers: TATUM_HEADERS }
+    );
+
+    // 🔥 IMPORTANT: values are in BTC
+    const incomingBtc = Number(r.data.incoming || 0);
+    const outgoingBtc = Number(r.data.outgoing || 0);
+
+    const balanceBtc = incomingBtc - outgoingBtc;
+    const balanceSats = Math.round(balanceBtc * 1e8);
 
     res.json({
-      network: NETWORK_NAME,
+      success: true,
+      chain: "BTC",
       address,
-      privateKeyWIF
+      balance_btc: balanceBtc,
+      balance_sats: balanceSats,
+      incoming_btc: incomingBtc,
+      outgoing_btc: outgoingBtc,
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error("BTC BALANCE ERROR 👉", err.response?.data || err.message);
+    res.status(500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
 
-// Import via mnemonic
-router.post('/wallet/import/mnemonic', (req, res) => {
-  try {
-    const { mnemonic, accountIndex = 0, addressIndex = 0 } = req.body;
-    if (!mnemonic) {
-      return res.status(400).json({ error: 'mnemonic required' });
-    }
 
-    const { child, path } = deriveFromMnemonic(
-      mnemonic,
-      accountIndex,
-      addressIndex
-    );
 
-    res.json({
-      network: NETWORK_NAME,
-      mnemonic,
-      derivationPath: path,
-      address: buildAddressFromNode(child),
-      privateKeyWIF: child.toWIF()
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Balance
-router.get('/:address/balance', async (req, res) => {
-  try {
-    const bal = await fetchBalance(req.params.address);
-    res.json({
-      address: req.params.address,
-      network: NETWORK_NAME,
-      balance_sats: bal.sats,
-      balance_btc: bal.btc,
-      confirmed_sats: bal.confirmed_sats
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Send BTC
-router.post('/:from/send', async (req, res) => {
+router.post("/:from/send", async (req, res) => {
   try {
     const { from } = req.params;
-    const { privateKeyWIF, to, amount, feeRate } = req.body;
+    const { to, amount, privateKey } = req.body;
 
-    if (!privateKeyWIF || !to || !amount) {
-      return res.status(400).json({ error: 'privateKeyWIF, to, amount required' });
-    }
-
-    const keyPair = bitcoin.ECPair.fromWIF(privateKeyWIF, NETWORK);
-    const fromAddress = bitcoin.payments.p2wpkh({
-      pubkey: keyPair.publicKey,
-      network: NETWORK
-    }).address;
-
-    if (fromAddress !== from) {
-      return res.status(400).json({ error: 'privateKey mismatch' });
-    }
-
-    const utxos = await fetchUtxos(fromAddress);
-    if (!utxos.length) {
-      return res.status(400).json({ error: 'no utxos available' });
-    }
-
-    const rate = feeRate || await fetchFeeRate();
-    const amountSats = btcToSats(amount);
-
-    const { chosen, sum } = selectUtxosGreedy(
-      utxos,
-      amountSats + 1000
-    );
-
-    const fee = Math.ceil(
-      estimateTxVsize(chosen.length, 2) * rate
-    );
-
-    if (sum < amountSats + fee) {
-      return res.status(400).json({ error: 'insufficient funds' });
-    }
-
-    const psbt = new bitcoin.Psbt({ network: NETWORK });
-
-    chosen.forEach(u => {
-      psbt.addInput({
-        hash: u.txid,
-        index: u.vout,
-        witnessUtxo: {
-          script: bitcoin.payments.p2wpkh({
-            pubkey: keyPair.publicKey,
-            network: NETWORK
-          }).output,
-          value: u.value
-        }
+    if (!from || !to || !amount || !privateKey) {
+      return res.status(400).json({
+        error: "from, to, amount, privateKey required",
       });
-    });
+    }
 
-    psbt.addOutput({ address: to, value: amountSats });
-    psbt.addOutput({
-      address: fromAddress,
-      value: sum - amountSats - fee
-    });
+    // 🔹 Tatum BTC send payload
+    const payload = {
+      fromAddress: [
+        {
+          address: from,
+          privateKey: privateKey,
+        },
+      ],
+      to: [
+        {
+          address: to,
+          value: Number(amount),
+        },
+      ],
+    };
 
-    chosen.forEach((_, i) => psbt.signInput(i, keyPair));
-    psbt.finalizeAllInputs();
-
-    const txid = await broadcastTx(
-      psbt.extractTransaction().toHex()
+    const r = await axios.post(
+      `${TATUM_API}/bitcoin/transaction`,
+      payload,
+      { headers: TATUM_HEADERS }
     );
 
     res.json({
-      network: NETWORK_NAME,
-      from: fromAddress,
+      success: true,
+      chain: "BTC",
+      from,
       to,
-      amount_btc: amount,
-      amount_sats: amountSats,
-      fee_sats: fee,
-      txid
+      amount,
+      txId: r.data.txId,
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error("BTC TATUM SEND ERROR 👉", err.response?.data || err.message);
+
+    res.status(500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
+
+
 
 export default router;
