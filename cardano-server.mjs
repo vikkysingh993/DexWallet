@@ -26,6 +26,18 @@ const BF_HEADERS = {
   project_id: BLOCKFROST_KEY,
 };
 
+
+const TATUM_KEY = process.env.TATUM_API_KEY;
+
+// Always Mainnet
+const TATUM_GATEWAY = "https://cardano-mainnet.gateway.tatum.io";
+
+const TATUM_HEADERS = {
+  "x-api-key": TATUM_KEY,
+  "Content-Type": "application/json",
+};
+
+
 /* ===============================
    HELPERS
 ================================ */
@@ -90,6 +102,8 @@ router.post("/wallet/create", (req, res) => {
   }
 });
 
+
+
 // Import Wallet
 router.post("/wallet/import", (req, res) => {
   try {
@@ -105,30 +119,51 @@ router.post("/wallet/import", (req, res) => {
   }
 });
 
-// Get Balance
-router.get("/:address/balance", async (req, res) => {
+
+/* =====================================
+   GET BALANCE (ADA)
+===================================== */
+
+router.get("/balance/:address", async (req, res) => {
   try {
     const { address } = req.params;
 
-    const r = await axios.get(
-      `${BLOCKFROST_URL}/addresses/${address}`,
-      { headers: BF_HEADERS }
+    // Basic validation
+    if (!address.startsWith("addr1")) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid mainnet Cardano address",
+      });
+    }
+
+    const response = await axios.get(
+      `https://api.tatum.io/v3/ada/account/${address}`,
+      {
+        headers: {
+          accept: "application/json",
+          "x-api-key": process.env.TATUM_API_KEY,
+        },
+      }
     );
 
-    const lovelace = r.data.amount.find(
-      (a) => a.unit === "lovelace"
+    const adaData = response.data.find(
+      (item) => item.currency.symbol === "ADA"
     );
 
-    const qty = lovelace ? Number(lovelace.quantity) : 0;
+    const lovelace = adaData ? adaData.value : "0";
 
     res.json({
+      success: true,
       address,
-      balance_lovelace: qty,
-      balance_ada: qty / 1_000_000,
+      balance_ada: Number(lovelace) / 1_000_000,
+      balance_lovelace: lovelace,
     });
+
   } catch (err) {
+    console.error("Balance Error:", err.response?.data);
     res.status(500).json({
-      error: err.response?.data || err.message,
+      success: false,
+      error: "Unable to fetch balance",
     });
   }
 });
@@ -284,5 +319,14 @@ router.post("/send", async (req, res) => {
     });
   }
 });
+
+
+
+
+
+
+
+
+
 
 export default router;
