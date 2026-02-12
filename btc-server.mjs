@@ -176,6 +176,95 @@ router.post("/wallet/create", (req, res) => {
 
 
 
+/* ===============================
+   IMPORT WALLET FROM WIF
+================================ */
+router.post("/wallet/import", (req, res) => {
+  try {
+    const { privateKeyWIF } = req.body;
+
+    if (!privateKeyWIF) {
+      return res.status(400).json({
+        error: "privateKeyWIF required",
+      });
+    }
+
+    // Create key pair from WIF
+    const keyPair = ECPair.fromWIF(privateKeyWIF, NETWORK);
+
+    // Generate Native SegWit address
+    const { address } = bitcoin.payments.p2wpkh({
+      pubkey: keyPair.publicKey,
+      network: NETWORK,
+    });
+
+    res.json({
+      success: true,
+      network: NETWORK_NAME,
+      address,
+      privateKeyWIF,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Invalid WIF or failed to import wallet",
+      details: err.message,
+    });
+  }
+});
+
+
+
+
+/* ===============================
+   IMPORT WALLET FROM MNEMONIC
+================================ */
+router.post("/wallet/import/mnemonic", (req, res) => {
+  try {
+    const {
+      mnemonic,
+      accountIndex = 0,
+      addressIndex = 0,
+    } = req.body;
+
+    if (!mnemonic) {
+      return res.status(400).json({
+        error: "mnemonic required",
+      });
+    }
+
+    if (!bip39.validateMnemonic(mnemonic)) {
+      return res.status(400).json({
+        error: "Invalid mnemonic",
+      });
+    }
+
+    const seed = bip39.mnemonicToSeedSync(mnemonic);
+    const root = bip32.fromSeed(seed, NETWORK);
+
+    const path = `m/${DEFAULT_PURPOSE}'/${DEFAULT_COIN}'/${accountIndex}'/0/${addressIndex}`;
+    const child = root.derivePath(path);
+
+    const address = buildAddressFromNode(child);
+
+    res.json({
+      success: true,
+      network: NETWORK_NAME,
+      derivationPath: path,
+      address,
+      privateKeyWIF: child.toWIF(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Failed to import mnemonic",
+      details: err.message,
+    });
+  }
+});
+
+
+
+
+
 
 /* ===============================
    GET BTC BALANCE (TATUM)
